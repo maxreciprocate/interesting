@@ -1,5 +1,5 @@
 {
   "reportUndefinedVariable": "none",
-  "reportGeneralTypeIssues": "none"
+  "reportGeneralTypeIssues": "none",
   "reportMissingImports": "none"
 }

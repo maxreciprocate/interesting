@@ -9,8 +9,8 @@ from trueskill import Rating, rate_1vs1
 
 # ■ ;;;;;
 
-vocabsize = 32
-ntoks = 16
+vocabsize = 16
+ntoks = 4
 
 xs = np.ones(vocabsize, dtype=bool)
 for i in range(2, vocabsize // 2):
@@ -18,18 +18,6 @@ for i in range(2, vocabsize // 2):
         xs[j] = False
 
 primes = from_numpy(np.where(xs)[0][2:])
-
-# ■ ;;;;;
-
-rm = lambda x, y: x + y
-
-import sympy
-x = sympy.symbols('x')
-xx = sympy.log(1 / (1 + sympy.exp(-x)))
-
-xs = np.linspace(-10, 10)
-pyplot.plot(xs, ff(xs));
-ff = lambda x: np.log(1 / (1 + np.exp(rm(0, x) - rm(0, 1))))
 
 # ■ ;;;;;
 
@@ -54,7 +42,7 @@ def oppsearch(idx, K, diff=10):
             p0 = p
 
 def score(ts):
-    # return ts.sum()
+    return ts.sum()
     count = (ts[:,None] - primes) == 0
     return th.sum(th.any(count, dim=0))
     # return th.all(th.diff(ts[mask]) == 0, dim=-1).float()
@@ -79,104 +67,37 @@ def match(a, b, X, K, trueskill=True):
 
     return sign
 
-X = th.randint(vocabsize, (10000, ntoks))
-# K = [[Rating(), idx] for idx in range(X.shape[0])]
-K = [[0, idx] for idx in range(X.shape[0])]
-# K = sorted(K, key=lambda x: x[0].mu)
+def test_rm(RM, xs=None):
+    if xs is None:
+        trand = th.random.manual_seed(100)
+        xs = th.randint(vocabsize, (1000, ntoks), generator=trand)
 
-# reduce sigma
-# sigmas = [k[0].sigma for k in K]
+        scores = th.hstack([score(x) for x in xs.unbind()])
+        sidxs = scores.argsort()
 
-# idxs = np.arange(len(sigmas))
+        scores = scores[sidxs]
+        left = xs[sidxs][:len(xs) // 2][:, None, :]
+        right = xs[sidxs][len(xs) // 2:][:, None, :]
 
-# ps = np.exp(sigmas) / (np.sum(np.exp(sigmas)) + 1)
-# ps /= ps.sum()
+        xs = th.stack((right, left), dim=1).squeeze(2)
 
-class RewardModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.master = YOGPT(vocabsize=vocabsize, nheads=1, nembd=64, ntoks=ntoks, nlayers=8)
-        self.tail = nn.Linear(vocabsize * ntoks, 1)
+    rewards = RM(xs.view(-1, ntoks)).view(-1, 2)
+    accuracy = th.mean((th.diff(rewards) < 0).float()).item()
 
-    def forward(self, x):
-        return self.tail(F.relu(self.master(x).view(-1, vocabsize * ntoks)))
+    print(f"rm's {accuracy = :.2f}")
 
 # ■ ;;;;;
 
-RM = RewardModel()
-opt = th.optim.Adam(RM.parameters())
-
-diff =  1
-xs = []
-
-for a, b in randint(len(X), size=(1000, 2)):
-    if score(X[a]) > score(X[b]):
-        xs.append((th.vstack((X[a], X[b])))[None])
-    elif score(X[a]) < score(X[b]):
-        xs.append((th.vstack((X[b], X[a])))[None])
-
-# for kaopp in np.random.choice(np.arange(len(X)), size=10000):
-#     kbopp = oppsearch(kaopp, K, diff)
-#     sign = match(kaopp, kbopp, X, K, trueskill=True)
-
-#     if sign > 0:
-#         xs.append((th.vstack((X[kaopp], X[kbopp])))[None])
-#     elif sign < 0:
-#         xs.append((th.vstack((X[kbopp], X[kaopp])))[None])
-
-#     K = sorted(K, key=lambda x: x[0].mu)
-#     mus = [k[0].mu for k in K]
-#     diff = np.diff(mus).max() + 1
-
-comparisons = th.vstack(xs)
-
-# yys = th.vstack(yys) + 1
-# xxs = th.vstack(xxs)
-# ■ ;;;;;
-bsize = 64
-
-tbar = tqdm(range(1024))
-for _ in tbar:
-    idxs = randint(len(xs), size=(bsize,))
-    batch = comparisons[idxs].view(-1, ntoks)
-    rewards = RM(batch)
-    rr = rewards.view(bsize, 2)
-
-    opt.zero_grad()
-    # loss = th.mean(th.log_softmax(rr, -1)[:, 0])
-    insigma = th.diff(rr)
-    loss = th.mean(th.log(th.sigmoid(insigma) + 1e-24))
-
-    loss.backward()
-    opt.step()
-    tbar.set_description(f'{loss.item()=:.2f}')
-
-# ■ ;;;;;
-
-RM.eval()
-sidxs = np.argsort([score(x) for x in X.unbind()])
-scores = [score(x).item() for x in X[sidxs].unbind()]
-scores[-10:]
-sX = X[sidxs]
-
-rewards = RM(sX)
-rewards
-diff = th.diff(rewards.squeeze())
-sdiff = np.diff(scores)
-(sdiff > 0).mean()
-(diff > 0).float().mean()
-diff.mean()
-rewards[-1] - rewards[0]
-
-# ■ ;;;;;
-
-RM.eval()
+normed = lambda xs: (xs - xs.mean()) / (xs.std() + 1e-24)
+comparisons = 0
 
 class Ranking:
     def __init__(self, *, nfat, maxtimestep, batchsize, nepisodes, trueskill=True, rewardmodel=False):
         self.X = th.zeros(nepisodes, maxtimestep+1, dtype=th.long)
         self.R = th.zeros(nepisodes, 1, dtype=th.float32)
         self.K = [[Rating() if trueskill else 0, idx] for idx in range(self.X.shape[0])]
+        self.comparisons = 0
+        self.Comps = None
         self.trueskill = trueskill
         self.rewardmodel = rewardmodel
 
@@ -192,27 +113,63 @@ class Ranking:
 
         self.X[self.idx:newidx] = X
 
-        if not self.rewardmodel:
-            self.K[self.idx:newidx] = [[Rating() if self.trueskill else 0, idx] for idx in range(self.idx, newidx)]
+        self.K[self.idx:newidx] = [[Rating() if self.trueskill else 0, idx] for idx in range(self.idx, newidx)]
 
-        # matchmaking goes here
-            idx_ = range(self.idx, newidx)
-            _idx = th.randint(self.nepisodes if self.full else newidx, (self.nfat,))
+        idx_ = range(self.idx, newidx)
+        _idx = th.randint(self.nepisodes if self.full else newidx, (self.nfat,))
+        comps = []
 
-            for aidx, bidx in zip(idx_, _idx):
-                sign = match(aidx, bidx, self.X, self.K, trueskill=self.trueskill)
+        for aidx, bidx in zip(idx_, _idx):
+            self.comparisons += 1
+            sign = match(aidx, bidx, self.X, self.K, trueskill=self.trueskill)
 
-                if self.trueskill:
-                    self.R[aidx] = self.K[aidx][0].mu - 3 * self.K[aidx][0].sigma
-                    self.R[bidx] = self.K[bidx][0].mu - 3 * self.K[bidx][0].sigma
-                else:
-                    self.R[aidx] = self.K[aidx][0]
-                    self.R[bidx] = self.K[bidx][0]
+            if sign > 0:
+                comps.append(th.vstack((self.X[aidx], self.X[bidx]))[None,:])
+            elif sign < 0:
+                comps.append(th.vstack((self.X[bidx], self.X[aidx]))[None,:])
 
-        if self.rewardmodel:
-            with th.no_grad():
-                self.R[self.idx:newidx] = RM(X)
+            # take this as truth
+            if self.trueskill:
+                self.R[aidx] = self.K[aidx][0].mu - 3 * self.K[aidx][0].sigma
+                self.R[bidx] = self.K[bidx][0].mu - 3 * self.K[bidx][0].sigma
+            else:
+                self.R[aidx] = self.K[aidx][0]
+                self.R[bidx] = self.K[bidx][0]
 
+        if len(comps) > 0:
+            if self.Comps is None:
+                self.Comps = th.vstack(comps)
+            else:
+                # add nonce to differentiate old ones?
+                self.Comps = th.vstack((self.Comps, th.vstack(comps)))
+
+        RM.train()
+
+        bsize=4
+
+        for _ in range(4):
+            idxs = randint(len(self.Comps), size=(bsize,))
+            batch = self.Comps[idxs].view(-1, ntoks)
+            rewards = RM(batch)
+            rr = rewards.view(bsize, 2)
+
+            RMopt.zero_grad()
+            insigma = th.diff(rr)
+            loss = th.mean(th.log(th.sigmoid(insigma) + 1e-24))
+
+            loss.backward()
+            RMopt.step()
+
+        # RM.eval()
+
+        # test_rm(RM)
+        # print(f"{loss.item()=}")
+
+        # R = normed(self.R[idx_])
+        # _R = normed(RM(X))
+
+        # print(f'{loss.item()=:.2f}')
+        # print(f'{(R - _R).abs().mean().item()=}')
 
         self.idx = newidx % self.nepisodes
 
@@ -229,8 +186,8 @@ class Ranking:
         )
 
 # vocabsize = 16
+# buffer.Comps
 # ntoks = 8
-model = YOGPT(vocabsize=vocabsize, nheads=1, nembd=64, ntoks=ntoks, nlayers=8)
 
 class CompetitivePrimeEnv:
     def __init__(self, *, ntoks, nfat):
@@ -256,29 +213,43 @@ class CompetitivePrimeEnv:
 
         return self.state
 
-
 nfat = 32
 env = CompetitivePrimeEnv(ntoks=ntoks, nfat=nfat)
 nin = env.ntoks
 nout = 1
 maxtimestep = env.ntoks-1
 
-buffer = Ranking(nfat=nfat, nepisodes=256, maxtimestep=env.ntoks-1, batchsize=64, trueskill=True, rewardmodel=False)
-opt = th.optim.Adam(model.parameters())
+class RewardModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.master = YOGPT(vocabsize=vocabsize, nheads=4, nembd=32, ntoks=ntoks, nlayers=4)
+        self.tail = nn.Linear(vocabsize * ntoks, 1)
+
+    def forward(self, x):
+        return self.tail(F.relu(self.master(x).view(-1, vocabsize * ntoks)))
+
+RM = RewardModel()
+RMopt = th.optim.Adam(RM.parameters())
+
+PI = YOGPT(vocabsize=vocabsize, nheads=4, nembd=128, ntoks=ntoks, nlayers=4)
+PIopt = th.optim.Adam(PI.parameters())
+
+buffer = Ranking(nfat=nfat, nepisodes=1024, maxtimestep=env.ntoks-1, batchsize=64, trueskill=True, rewardmodel=False)
 
 nepisodes = 100
 epsilon = 0.1
 
+RngExplore = np.random.RandomState(777)
 tbar = tqdm(range(nepisodes))
 for iepisode in tbar:
     o = env.reset()
 
     for t in range(env.ntoks * 100):
         with th.no_grad():
-            if rand() < epsilon:
+            if RngExplore.rand() < epsilon:
                 m = th.randint(vocabsize, size=(nfat,))
             else:
-                logits = model(o[..., :t+1])[:, -1, :]
+                logits = PI(o[..., :t+1])[:, -1, :]
 
                 dist = Categorical(logits=logits)
                 m = dist.sample()
@@ -297,29 +268,34 @@ for iepisode in tbar:
 
     R = (R - R.mean()) / R.std()
 
-    logp = F.log_softmax(model(X[..., :-1]), -1).gather(-1, X[..., 1:, None]).squeeze(-1)
+    logp = F.log_softmax(PI(X[..., :-1]), -1).gather(-1, X[..., 1:, None]).squeeze(-1)
     loss = -(R * logp).mean()
 
-    opt.zero_grad()
+    PIopt.zero_grad()
     loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), 1)
-    opt.step()
+    nn.utils.clip_grad_norm_(PI.parameters(), 1)
+    PIopt.step()
 
     if not(iepisode % 10):
         tbar.set_description(f'loss = {loss.item():.2f}')
         # master.load_state_dict(model.state_dict())
 
-print(f'total {nfat*nepisodes} comparisons')
+print(f'total {buffer.comparisons}/{nfat*nepisodes} ({buffer.comparisons / (nfat*nepisodes)}) comparisons')
 
-model.eval()
+test_rm(RM, buffer.Comps)
+
+PI.eval()
+RM.eval()
+
 stanzas = []
+totalscore = 0
 
 with th.no_grad():
     for context in range(vocabsize):
         o = tensor([context])
 
         while len(o) < env.ntoks:
-            m = model(o[None])[:, -1, :]
+            m = PI(o[None])[:, -1, :]
             m = Categorical(F.softmax(m, -1)).sample()
 
             o = th.hstack((o, m))
@@ -327,4 +303,7 @@ with th.no_grad():
         stanzas.append(o)
 
 for stanza in stanzas:
+    totalscore += score(stanza)
     print(f'{score(stanza)}r, {RM(stanza[:,None]).item():.0f}R, {stanza=}, ')
+
+totalscore
