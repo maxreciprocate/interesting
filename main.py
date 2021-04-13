@@ -9,7 +9,7 @@ from trueskill import Rating, rate_1vs1
 
 # ■ ;;;;;
 
-vocabsize = 16
+vocabsize = 32
 ntoks = 4
 
 xs = np.ones(vocabsize, dtype=bool)
@@ -43,15 +43,20 @@ def oppsearch(idx, K, diff=10):
 
 def score(ts):
     return ts.sum()
-    count = (ts[:,None] - primes) == 0
-    return th.sum(th.any(count, dim=0))
+    # count = (ts[:,None] - primes) == 0
+    # return th.sum(th.any(count, dim=0))
     # return th.all(th.diff(ts[mask]) == 0, dim=-1).float()
 
-def match(a, b, X, K, trueskill=True):
+def match(a, b, X, K, use_rm=False, trueskill=True):
     if a == b:
         return 0
 
-    sign = th.sign(score(X[K[a][1]]) - score(X[K[b][1]]))
+    if use_rm:
+        rewards = RM(th.vstack((X[1], X[2])))
+        diff = -th.diff(rewards, dim=0)
+        sign = th.sign(diff)
+    else:
+        sign = th.sign(score(X[K[a][1]]) - score(X[K[b][1]]))
 
     if not trueskill:
         K[a][0] += sign
@@ -89,12 +94,12 @@ def test_rm(RM, xs=None):
 # ■ ;;;;;
 
 normed = lambda xs: (xs - xs.mean()) / (xs.std() + 1e-24)
-comparisons = 0
 
 class Ranking:
     def __init__(self, *, nfat, maxtimestep, batchsize, nepisodes, trueskill=True, rewardmodel=False):
         self.X = th.zeros(nepisodes, maxtimestep+1, dtype=th.long)
         self.R = th.zeros(nepisodes, 1, dtype=th.float32)
+        self.logps = th.zeros(nepisodes, maxtimestep+1, dtype=th.float32)
         self.K = [[Rating() if trueskill else 0, idx] for idx in range(self.X.shape[0])]
         self.comparisons = 0
         self.Comps = None
@@ -108,25 +113,38 @@ class Ranking:
         self.batchsize = batchsize
         self.full = False
 
-    def add(self, X):
+    def add(self, X, logps):
         newidx = self.idx + self.nfat
 
         self.X[self.idx:newidx] = X
+        self.logps[self.idx:newidx] = logps
 
         self.K[self.idx:newidx] = [[Rating() if self.trueskill else 0, idx] for idx in range(self.idx, newidx)]
 
         idx_ = range(self.idx, newidx)
+        # maybe reduce sigma here instead?
         _idx = th.randint(self.nepisodes if self.full else newidx, (self.nfat,))
         comps = []
 
-        for aidx, bidx in zip(idx_, _idx):
-            self.comparisons += 1
-            sign = match(aidx, bidx, self.X, self.K, trueskill=self.trueskill)
+        # how about sieving RM only through K-table?
+        # thus limiting influence of it's inevitable degeneracy
+        # but even then RM / real samples ratio will be too high
 
-            if sign > 0:
-                comps.append(th.vstack((self.X[aidx], self.X[bidx]))[None,:])
-            elif sign < 0:
-                comps.append(th.vstack((self.X[bidx], self.X[aidx]))[None,:])
+        for aidx, bidx in zip(idx_, _idx):
+
+            use_rm = False
+            if self.comparisons > 1000:
+                use_rm = rand() < 0.75
+
+            sign = match(aidx, bidx, self.X, self.K, use_rm=use_rm, trueskill=self.trueskill)
+
+            if not use_rm:
+                self.comparisons += 1
+
+                if sign > 0:
+                    comps.append(th.vstack((self.X[aidx], self.X[bidx]))[None,:])
+                elif sign < 0:
+                    comps.append(th.vstack((self.X[bidx], self.X[aidx]))[None,:])
 
             # take this as truth
             if self.trueskill:
@@ -145,7 +163,8 @@ class Ranking:
 
         RM.train()
 
-        bsize=4
+        bsize = 128
+        bsize = min(bsize, len(self.Comps))
 
         for _ in range(4):
             idxs = randint(len(self.Comps), size=(bsize,))
@@ -154,22 +173,13 @@ class Ranking:
             rr = rewards.view(bsize, 2)
 
             RMopt.zero_grad()
-            insigma = th.diff(rr)
-            loss = th.mean(th.log(th.sigmoid(insigma) + 1e-24))
+            diffrr = th.diff(rr)
+            loss = th.mean(th.log(th.sigmoid(diffrr) + 1e-24))
 
             loss.backward()
             RMopt.step()
 
-        # RM.eval()
-
-        # test_rm(RM)
-        # print(f"{loss.item()=}")
-
-        # R = normed(self.R[idx_])
-        # _R = normed(RM(X))
-
-        # print(f'{loss.item()=:.2f}')
-        # print(f'{(R - _R).abs().mean().item()=}')
+        RM.eval()
 
         self.idx = newidx % self.nepisodes
 
@@ -178,16 +188,16 @@ class Ranking:
             self.full = True
 
     def sample(self):
-        idxs = th.randint(0, self.nepisodes if self.full else self.idx, (self.batchsize,))
+        if self.full:
+            idxs = th.randint(self.nepisodes, (self.batchsize,))
+        else:
+            idxs = th.randint(0, self.idx, size=(self.batchsize,))
 
         return (
             self.X[idxs]
           , self.R[idxs]
+          , self.logps[idxs]
         )
-
-# vocabsize = 16
-# buffer.Comps
-# ntoks = 8
 
 class CompetitivePrimeEnv:
     def __init__(self, *, ntoks, nfat):
@@ -222,38 +232,42 @@ maxtimestep = env.ntoks-1
 class RewardModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.master = YOGPT(vocabsize=vocabsize, nheads=4, nembd=32, ntoks=ntoks, nlayers=4)
+        self.master = YOGPT(vocabsize=vocabsize, nheads=4, nembd=32, ntoks=ntoks, nlayers=4, pdrop=0.1)
         self.tail = nn.Linear(vocabsize * ntoks, 1)
 
     def forward(self, x):
         return self.tail(F.relu(self.master(x).view(-1, vocabsize * ntoks)))
 
 RM = RewardModel()
-RMopt = th.optim.Adam(RM.parameters())
+RMopt = th.optim.Adam(RM.parameters(), 1e-3)
 
-PI = YOGPT(vocabsize=vocabsize, nheads=4, nembd=128, ntoks=ntoks, nlayers=4)
+PI = YOGPT(vocabsize=vocabsize, nheads=4, nembd=32, ntoks=ntoks, nlayers=4, pdrop=0.1)
 PIopt = th.optim.Adam(PI.parameters())
 
-buffer = Ranking(nfat=nfat, nepisodes=1024, maxtimestep=env.ntoks-1, batchsize=64, trueskill=True, rewardmodel=False)
+VM = RewardModel()
+VMopt = th.optim.Adam(VM.parameters())
 
-nepisodes = 100
+buffer = Ranking(nfat=nfat, nepisodes=256, maxtimestep=env.ntoks-1, batchsize=64, trueskill=True, rewardmodel=False)
+
+nepisodes = 300
 epsilon = 0.1
 
 RngExplore = np.random.RandomState(777)
 tbar = tqdm(range(nepisodes))
+
 for iepisode in tbar:
     o = env.reset()
 
-    for t in range(env.ntoks * 100):
-        with th.no_grad():
-            if RngExplore.rand() < epsilon:
-                m = th.randint(vocabsize, size=(nfat,))
-            else:
-                logits = PI(o[..., :t+1])[:, -1, :]
+    oldlogp = []
 
-                dist = Categorical(logits=logits)
-                m = dist.sample()
-                dist.log_prob(m)
+    for t in range(env.ntoks):
+        with th.no_grad():
+            logits = PI(o[..., :t+1])[:, -1, :]
+
+            dist = Categorical(logits=logits)
+            m = dist.sample()
+
+            oldlogp.append(dist.log_prob(m))
 
             o_, r, done, _ = env.step(m)
 
@@ -262,30 +276,53 @@ for iepisode in tbar:
 
             o = o_
 
-    buffer.add(o)
+    oldlogp = th.hstack((th.zeros(nfat, 1), th.vstack(oldlogp).T))
 
-    X, R = buffer.sample()
+    buffer.add(o, oldlogp)
+
+    X, R, oldlogp = buffer.sample()
+
+    # V(. . .) = G
+    # Q(. . .) = G ?
 
     R = (R - R.mean()) / R.std()
 
-    logp = F.log_softmax(PI(X[..., :-1]), -1).gather(-1, X[..., 1:, None]).squeeze(-1)
-    loss = -(R * logp).mean()
+    # V = VM(X)
+    # VMopt.zero_grad()
+    # VMloss = (V - R).pow(2).mean()
+    # VMloss.backward()
+    # VMopt.step()
+
+    logps = F.log_softmax(PI(X[..., :-1]), -1)
+
+    logp = logps.gather(-1, X[..., 1:, None]).squeeze(-1)
+
+    clipratio = 0.25
+    ratio = th.exp(logp - oldlogp[:, 1:].detach())
+    clipped = th.clamp(ratio, 1-clipratio, 1+clipratio)
+    PIloss = -th.min(clipped * R, ratio * R).mean()
+
+    pikl = (oldlogp[:, 1:] - logp).mean()
 
     PIopt.zero_grad()
-    loss.backward()
+    PIloss.backward()
     nn.utils.clip_grad_norm_(PI.parameters(), 1)
     PIopt.step()
 
-    if not(iepisode % 10):
-        tbar.set_description(f'loss = {loss.item():.2f}')
+    ps = th.exp(logps)
+    entropy = -(ps * logps).mean()
+
+    tbar.set_description(f'loss={PIloss.item():.2f}, KL={pikl.item():.2f}, H={entropy:.2f}, N={buffer.comparisons}')
         # master.load_state_dict(model.state_dict())
 
-print(f'total {buffer.comparisons}/{nfat*nepisodes} ({buffer.comparisons / (nfat*nepisodes)}) comparisons')
+print(f'total {buffer.comparisons}/{nfat*nepisodes} ({buffer.comparisons / (nfat*nepisodes):.2f}) comparisons')
 
-test_rm(RM, buffer.Comps)
 
 PI.eval()
 RM.eval()
+
+test_rm(RM, buffer.Comps)
+test_rm(RM)
 
 stanzas = []
 totalscore = 0
@@ -307,3 +344,4 @@ for stanza in stanzas:
     print(f'{score(stanza)}r, {RM(stanza[:,None]).item():.0f}R, {stanza=}, ')
 
 totalscore
+# ■ ;;;;;

@@ -1,14 +1,14 @@
 from imports import *
 
 class Attend(nn.Module):
-    def __init__(self, nheads, nembd, ntoks):
+    def __init__(self, nheads, nembd, ntoks, pdrop=0.0):
         super().__init__()
         self.key = nn.Linear(nembd, nembd)
         self.query = nn.Linear(nembd, nembd)
         self.value = nn.Linear(nembd, nembd)
 
-        self.attn_drop = nn.Dropout(0.1)
-        self.head_drop = nn.Dropout(0.1)
+        self.attn_drop = nn.Dropout(pdrop)
+        self.head_drop = nn.Dropout(pdrop)
         self.head = nn.Linear(nembd, nembd)
         self.nheads = nheads
 
@@ -34,16 +34,15 @@ class Attend(nn.Module):
 
 
 class AttendClose(nn.Module):
-    def __init__(self, nheads, nembd, ntoks):
+    def __init__(self, nheads, nembd, ntoks, pdrop=0.1):
         super().__init__()
         self.key = nn.Linear(nembd, nembd)
         self.query = nn.Linear(nembd, nembd)
         self.value = nn.Linear(nembd, nembd)
-
         self.register_buffer("mask", th.tril(th.ones(ntoks, ntoks)) == 0)
-        self.attention = nn.MultiheadAttention(nembd, nheads, dropout=0.1, bias=False)
+        self.attention = nn.MultiheadAttention(nembd, nheads, dropout=pdrop, bias=False)
         self.head = nn.Linear(nembd, nembd)
-        self.head_drop = nn.Dropout(0.1)
+        self.head_drop = nn.Dropout(pdrop)
 
     def forward(self, x):
         ntoks, nbatch, nembd = x.size()
@@ -58,7 +57,7 @@ class AttendClose(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, nheads, nembd, ntoks):
+    def __init__(self, nheads, nembd, ntoks, pdrop=0.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(nembd)
         self.ln2 = nn.LayerNorm(nembd)
@@ -70,7 +69,7 @@ class Block(nn.Module):
             nn.Linear(nembd, 4 * nembd),
             nn.GELU(),
             nn.Linear(4 * nembd, nembd),
-            nn.Dropout(0.1)
+            nn.Dropout(pdrop)
         )
 
     def forward(self, x):
@@ -80,7 +79,7 @@ class Block(nn.Module):
         return x
 
 class YOGPT(nn.Module):
-    def __init__(self, vocabsize, nheads, nembd, ntoks, nlayers):
+    def __init__(self, vocabsize, nheads, nembd, ntoks, nlayers, pdrop=0.0):
         super().__init__()
 
         self.vocabsize = vocabsize
@@ -90,9 +89,9 @@ class YOGPT(nn.Module):
 
         self.tok_emb = nn.Embedding(self.vocabsize, self.nembd)
         self.pos_emb = nn.Parameter(th.zeros(1, self.ntoks, self.nembd))
-        self.drop = nn.Dropout(0.1)
+        self.drop = nn.Dropout(pdrop)
 
-        self.blocks = nn.Sequential(*[Block(nheads=nheads, nembd=nembd, ntoks=ntoks) for _ in range(nlayers)])
+        self.blocks = nn.Sequential(*[Block(nheads=nheads, nembd=nembd, ntoks=ntoks, pdrop=pdrop) for _ in range(nlayers)])
         self.ln = nn.LayerNorm(nembd)
         self.head = nn.Linear(nembd, vocabsize, bias=False)
 
@@ -107,6 +106,7 @@ class YOGPT(nn.Module):
         x = self.drop(embs + positions)
         out = self.blocks(x)
         logits = self.head(self.ln(out))
+        # logits = self.head(out)
 
         return logits
 
