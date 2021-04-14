@@ -95,7 +95,7 @@ class YOGPT(nn.Module):
         self.ln = nn.LayerNorm(nembd)
         self.head = nn.Linear(nembd, vocabsize, bias=False)
 
-        print(f'params: {sum(p.numel() for p in self.parameters()) / 2**20:.2f}M')
+        print(f'{sum(p.numel() for p in self.parameters()) / 2**20:.2f}M params')
 
     def forward(self, x):
         bsize, ntoks = x.size()
