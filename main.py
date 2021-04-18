@@ -29,13 +29,18 @@ def oppsearch(idx, K, diff=10):
             p0 = p
 
 def score(context):
+    if test_task == "kink":
+        return th.sum(context == vocabsize - 1)
     if test_task == "maxsum":
         return context.sum()
     elif test_task == "unique":
+        repeats = th.diff(th.sort(context)[0]) == 0
         count = (context[:,None] - primes) == 0
-        return th.sum(th.any(count, dim=0))
-    else:
-        return 0
+        return th.sum(th.any(count, dim=0)) #- 0.3 * sum(repeats)
+    elif test_task == "sort":
+        return th.all(context == th.sort(context)[0]).float()
+
+    raise ValueError('weird test_task')
     # return th.all(th.diff(context[mask]) == 0, dim=-1).float()
 
 def match(a, b, X, K, use_rm=False, trueskill=True):
@@ -97,7 +102,77 @@ def test_pi(PI, xs):
     compscore = th.mean((th.diff(logpairs) < 0).float())
     return compscore.item()
 
+def sample(ps):
+    ps /= ps.sum()
+    cdf = ps.cumsum(-1)
+    x = rand()
+    for i in range(len(ps)):
+        if cdf[i] > x:
+            return i
+
+    return len(ps)-1
+
+def nucleus_sample(ps, p=0.9):
+    values, indices = ps.sort(descending=True)
+    totalp = 0
+
+    for idx in range(len(values)):
+        totalp += values[idx]
+        if totalp > p:
+            return indices[sample(values[:idx+1])]
+
+def unique_star(context):
+    ps = th.zeros(vocabsize) + 1e-24
+    ps[primes] = 1
+
+    for x in context:
+        ps[x] = 0
+
+    return ps / ps.sum()
+
+def maxsum_star(_):
+    ps = th.zeros(vocabsize) + 1e-24
+    ps[-1] = 1
+    return ps
+
+def roll(context):
+    print(f"{context} | _")
+
+    with th.no_grad():
+        context = th.zeros(1).long()
+        while len(context) < env.ntoks:
+            logits = PI(context[None])[:, -1, :]
+            ps = F.softmax(logits, -1).squeeze(0).detach()
+
+            ps_star = unique_star(context)
+            kl = ps_star @ log(ps_star / ps)
+
+            colors = ['slateblue'] * len(ps)
+            if test_task == 'unique':
+                for idx in primes:
+                    if idx not in context:
+                        colors[idx] = 'orange'
+
+            elif test_task == 'maxsum':
+                colors[-1] = 'orange'
+
+            pyplot.bar(range(len(ps)), ps, color=colors);
+            pyplot.xticks(range(len(ps)));
+            pyplot.show()
+
+            m = nucleus_sample(ps, p=0.6)
+
+            print(f"{context} | {m} {kl=}")
+            context = th.hstack((context, m))
+
+        print(f"{context} ~ {RM(context[None]).item():.2f}R")
+
+    return context
+
 # ■ ;;;;;
+
+def log(xs):
+    return th.log(xs + 1e-24)
 
 normed = lambda xs: (xs - xs.mean()) / (xs.std() + 1e-24)
 
@@ -130,6 +205,10 @@ class Ranking:
         idx_ = range(self.idx, newidx)
         # maybe reduce sigma here instead?
         _idx = th.randint(self.nepisodes if self.full else newidx, (self.nfat,))
+
+        # batch(idx_, _idx) -> comps
+        # update K, R
+
         comps = []
 
         # how about sieving RM only through K-table?
@@ -139,8 +218,8 @@ class Ranking:
         for aidx, bidx in zip(idx_, _idx):
 
             use_rm = False
-            if self.comparisons > 1000:
-                use_rm = rand() < 0.9
+            # if self.comparisons > 5000:
+            #     use_rm = rand() < 0.95
 
             sign = match(aidx, bidx, self.X, self.K, use_rm=use_rm, trueskill=self.trueskill)
 
@@ -167,26 +246,26 @@ class Ranking:
                 # add nonce to differentiate old ones?
                 self.Comps = th.vstack((self.Comps, th.vstack(comps)))
 
-        if self.comparisons < 1000 or rand() < 0.1:
-            RM.train()
+        # if self.comparisons < 5000 or rand() < 0.1:
+        #     RM.train()
 
-            bsize = 128
-            bsize = min(bsize, len(self.Comps))
+        #     bsize = 128
+        #     bsize = min(bsize, len(self.Comps))
 
-            for _ in range(4):
-                idxs = randint(len(self.Comps), size=(bsize,))
-                batch = self.Comps[idxs].view(-1, ntoks)
-                rewards = RM(batch)
-                rr = rewards.view(bsize, 2)
+        #     for _ in range(4):
+        #         idxs = randint(len(self.Comps), size=(bsize,))
+        #         batch = self.Comps[idxs].view(-1, ntoks)
+        #         rewards = RM(batch)
+        #         rr = rewards.view(bsize, 2)
 
-                RMopt.zero_grad()
-                diffrr = th.diff(rr)
-                loss = th.mean(th.log(th.sigmoid(diffrr) + 1e-24))
+        #         RMopt.zero_grad()
+        #         diffrr = th.diff(rr)
+        #         loss = th.mean(log(th.sigmoid(diffrr)))
 
-                loss.backward()
-                RMopt.step()
+        #         loss.backward()
+        #         RMopt.step()
 
-            RM.eval()
+        #     RM.eval()
 
         self.idx = newidx % self.nepisodes
 
@@ -226,14 +305,13 @@ class CompetitivePrimeEnv:
     def reset(self):
         self.idx = 1
         self.state.fill_(0)
-        self.state[:, 0] = 0 # th.randint(vocabsize, (self.nfat,))
+        self.state[:, 0] = th.randint(vocabsize, (self.nfat,))
 
         return self.state
 
-
 vocabsize = 16
 ntoks = 5
-test_task = 'maxsum'
+test_task = 'unique'
 
 xs = np.ones(vocabsize, dtype=bool)
 for i in range(2, vocabsize // 2):
@@ -242,7 +320,7 @@ for i in range(2, vocabsize // 2):
 
 primes = from_numpy(np.where(xs)[0][2:])
 
-nfat = 32
+nfat = 16
 env = CompetitivePrimeEnv(ntoks=ntoks, nfat=nfat)
 nin = env.ntoks
 nout = 1
@@ -251,21 +329,34 @@ maxtimestep = env.ntoks-1
 class RewardModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.master = YOGPT(vocabsize=vocabsize, nheads=4, nembd=128, ntoks=ntoks, nlayers=8, pdrop=0.1)
+        self.master = YOGPT(vocabsize=vocabsize, nheads=4, nembd=64, ntoks=ntoks, nlayers=8, pdrop=0.1)
         self.tail = nn.Linear(vocabsize * ntoks, 1)
 
     def forward(self, x):
         return self.tail(F.relu(self.master(x).view(-1, vocabsize * ntoks)))
 
+class ValueModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gpt = YOGPT(vocabsize=vocabsize, nheads=4, nembd=128, ntoks=ntoks, nlayers=4, pdrop=0.1)
+        self.head = nn.Linear(vocabsize, 1)
+
+    def forward(self, x):
+        return self.head(self.gpt(x))
+
+
 RM = RewardModel()
 RMopt = th.optim.Adam(RM.parameters(), 1e-3)
 
-PI = YOGPT(vocabsize=vocabsize, nheads=4, nembd=128, ntoks=ntoks, nlayers=8, pdrop=0.1)
+VM = ValueModel()
+VMopt = th.optim.Adam(VM.parameters(), 1e-3)
+
+PI = YOGPT(vocabsize=vocabsize, nheads=8, nembd=128, ntoks=ntoks, nlayers=8, pdrop=0.1)
 PIopt = th.optim.Adam(PI.parameters())
 
-buffer = Ranking(nfat=nfat, nepisodes=1024, maxtimestep=env.ntoks-1, batchsize=64, trueskill=True, rewardmodel=False)
+buffer = Ranking(nfat=nfat, nepisodes=128, maxtimestep=env.ntoks-1, batchsize=64, trueskill=True, rewardmodel=False)
 
-nepisodes = 100
+nepisodes = 200
 epsilon = 0.1
 
 RngExplore = np.random.RandomState(777)
@@ -296,109 +387,72 @@ for iepisode in tbar:
 
     buffer.add(o, oldlogp)
 
-    X, R, oldlogp = buffer.sample()
+    X, G, oldlogp = buffer.sample()
 
     # V(. . .) = G
     # Q(. . .) = G ?
 
-    R = (R - R.mean()) / R.std()
+    G = (G - G.mean()) / G.std()
+
+    V = VM(X).squeeze(-1)
+
+    VMopt.zero_grad()
+    VMloss = (V - G).pow(2).mean()
+    VMloss.backward()
+    VMopt.step()
 
     logps = F.log_softmax(PI(X[..., :-1]), -1)
     logp = logps.gather(-1, X[..., 1:, None]).squeeze(-1)
 
-    clipratio = 0.5
-    ratio = th.exp(logp - oldlogp[:, 1:].detach())
-    clipped = th.clamp(ratio, 1-clipratio, 1+clipratio)
-    PIloss = -th.min(clipped * R, ratio * R).mean()
+    ps = th.exp(logps)
+    entropy = -(ps * logps).sum()
+
+    # clipratio = 0.2
+    # ratio = th.exp(logp - oldlogp[:, 1:].detach())
+    # clipped = th.clamp(ratio, 1-clipratio, 1+clipratio)
+    # PIloss = -th.min(clipped * (G - V[:, :-1]).detach(), ratio * R).mean()
+    PIloss = -th.mean(logp * (G - V[:, :-1].detach())) - 0.001 * entropy
 
     PIopt.zero_grad()
     PIloss.backward()
     nn.utils.clip_grad_norm_(PI.parameters(), 1)
     PIopt.step()
 
-    ps = th.exp(logps)
-    entropy = -(ps * logps).sum()
     pikl = (oldlogp[:, 1:] - logp).mean()
 
     tbar.set_description(f'loss={PIloss.item():.2f}, KL={pikl.item():.2f}, H={entropy:.2f}, N={buffer.comparisons}')
 
+    if not(iepisode % 5):
+        roll(tensor([0]))
+
 print(f'total {buffer.comparisons}/{nfat*nepisodes} ({buffer.comparisons / (nfat*nepisodes):.2f}) comparisons')
+# ■ ;;;;;
 
 PI.eval()
 RM.eval()
 
 # would like to see here >0.9
-print(f"{test_pi(PI, buffer.Comps)=:.2f}")
-print(f"{test_rm(RM, buffer.Comps)=:.2f}")
-print(f"{test_rm(RM)=:.2f}")
-
+# print(f"{test_pi(PI, buffer.Comps)=:.2f}")
+# print(f"{test_rm(RM, buffer.Comps)=:.2f}")
+# print(f"{test_rm(RM)=:.2f}")
 # ■ ;;;;;
+
+roll(tensor([0]))
 
 stanzas = []
 totalscore = 0
 
-def sample(ps):
-    ps /= ps.sum()
-    cdf = ps.cumsum(-1)
-    x = rand()
-
-    for i in range(len(ps)):
-        if cdf[i] > x:
-            return i
-
-    return len(ps)-1
-
-def nucleus_sample(ps, p=0.8):
-    values, indices = ps.sort(descending=True)
-    totalp = 0
-
-    for idx in range(len(values)):
-        totalp += values[idx]
-        if totalp > p:
-            return indices[sample(values[:idx+1])]
-
-def roll(context):
-    print(f"{context} | _")
-
-    with th.no_grad():
-        while len(context) < env.ntoks:
-            logits = PI(context[None])[:, -1, :]
-            ps = F.softmax(logits, -1).squeeze(0).detach()
-
-            colors = ['slateblue'] * len(ps)
-            if test_task == 'unique':
-                for idx in primes:
-                    if idx not in context:
-                        colors[idx] = 'orange'
-
-            elif test_task == 'maxsum':
-                colors[-1] = 'orange'
-
-            pyplot.bar(range(len(ps)), ps, color=colors);
-            pyplot.xticks(range(len(ps)));
-            pyplot.show()
-
-            m = nucleus_sample(ps)
-
-            print(f"{context} | {m}")
-            context = th.hstack((context, m))
-
-        print(f"{context} ~ {RM(context[None]).item():.2f}R")
-
-    return context
-
-roll(tensor([0]))
-
 with th.no_grad():
     for context in range(vocabsize):
-        o = tensor([0])
+        o = tensor([context])
+        o = tensor([context])
 
         while len(o) < env.ntoks:
             logits = PI(o[None])[:, -1, :]
             ps = F.softmax(logits, -1).squeeze(0).detach()
 
-            m = nucleus_sample(ps)
-            # m = ps.argmax()
+            # m = nucleus_sample(ps, p=0.2)
+            m = ps.argmax()
             # m = tensor(sample(ps))
 
             o = th.hstack((o, m))
@@ -409,4 +463,4 @@ for stanza in stanzas:
     totalscore += score(stanza)
     print(f'{score(stanza)}r, {RM(stanza[:,None]).item():.0f}R, {stanza=}, ')
 
-totalscore
+print(f"total {totalscore.item()}/70")
